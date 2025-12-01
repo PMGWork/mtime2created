@@ -1,4 +1,4 @@
-import { Plugin, Notice, FileSystemAdapter, TFile, moment } from 'obsidian';
+import { Plugin, Notice, FileSystemAdapter, TFile, TAbstractFile, moment } from 'obsidian';
 import * as fs from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
@@ -13,6 +13,7 @@ const messages = {
     errorSyncing: '時刻の同期中にエラーが発生しました',
     errorGettingStats: 'ファイル情報の取得中にエラーが発生しました。',
     syncSuccess: '修正日時を作成日時に同期しました',
+    batchSuccess: '完了: {success} 件, 失敗: {fail} 件',
   },
   en: {
     commandName: 'Sync mtime to created',
@@ -22,6 +23,7 @@ const messages = {
     errorSyncing: 'Error syncing time',
     errorGettingStats: 'Error getting file stats.',
     syncSuccess: 'Synced modification time to creation time',
+    batchSuccess: 'Done: {success}, Failed: {fail}',
   }
 };
 
@@ -63,6 +65,22 @@ export default class Mtime2CreatedPlugin extends Plugin {
         }
       })
     );
+
+    this.registerEvent(
+      this.app.workspace.on('files-menu', (menu, files) => {
+        const tFiles = files.filter((f) => f instanceof TFile) as TFile[];
+        if (tFiles.length > 0) {
+          menu.addItem((item) => {
+            item
+              .setTitle(this.t('menuTitle'))
+              .setIcon('clock')
+              .onClick(() => {
+                this.syncBatch(tFiles);
+              });
+          });
+        }
+      })
+    );
   }
 
   /**
@@ -88,38 +106,67 @@ export default class Mtime2CreatedPlugin extends Plugin {
       return;
     }
 
+    try {
+      await this.processFile(targetFile);
+      // 成功時のメッセージは processFile 内ではなくここで出す（単一ファイルの場合）
+      // しかし processFile は void なので、日付を取得しなおすか、processFile が日付を返すようにするか。
+      // 既存の挙動に合わせるため、processFile 内で日付計算しているが、
+      // ここでは簡易的に現在時刻完了とするか、processFile から戻り値をもらう。
+      // シンプルに「同期しました」で良い。
+      new Notice(this.t('syncSuccess'));
+    } catch (err) {
+      new Notice(`${this.t('errorSyncing')}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async syncBatch(files: TFile[]) {
+    let successCount = 0;
+    let failCount = 0;
+
+    const promises = files.map(async (file) => {
+      try {
+        await this.processFile(file);
+        successCount++;
+      } catch (e) {
+        console.error(`Failed to sync ${file.path}:`, e);
+        failCount++;
+      }
+    });
+
+    await Promise.all(promises);
+
+    const msg = this.t('batchSuccess' as any)
+      .replace('{success}', successCount.toString())
+      .replace('{fail}', failCount.toString());
+    new Notice(msg);
+  }
+
+  async processFile(file: TFile): Promise<void> {
     if (!(this.app.vault.adapter instanceof FileSystemAdapter)) {
-      new Notice(this.t('notFileSystem'));
-      return;
+      throw new Error(this.t('notFileSystem'));
     }
 
     const basePath = this.app.vault.adapter.getBasePath();
-    const filePath = path.join(basePath, targetFile.path);
+    const filePath = path.join(basePath, file.path);
 
-    try {
-      const stats = fs.statSync(filePath);
-      const birthtime = stats.birthtime;
+    return new Promise((resolve, reject) => {
+      try {
+        const stats = fs.statSync(filePath);
+        const birthtime = stats.birthtime;
+        const formattedDate = this.formatDateForSetFile(birthtime);
+        const command = `SetFile -m "${formattedDate}" "${filePath}"`;
 
-      // Format date for SetFile: "MM/DD/YYYY HH:MM:SS"
-      const formattedDate = this.formatDateForSetFile(birthtime);
-
-      // Command to update modification time (mtime) on macOS
-      // SetFile -m "MM/DD/YYYY HH:MM:SS" filename
-      const command = `SetFile -m "${formattedDate}" "${filePath}"`;
-
-      exec(command, (error, stdout, stderr) => {
-        if (error) {
-          console.error(`exec error: ${error}`);
-          new Notice(`${this.t('errorSyncing')}: ${error.message}`);
-          return;
-        }
-        new Notice(`${this.t('syncSuccess')}: ${formattedDate}`);
-      });
-
-    } catch (err) {
-      console.error('Error getting file stats:', err);
-      new Notice(this.t('errorGettingStats'));
-    }
+        exec(command, (error, stdout, stderr) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
   formatDateForSetFile(date: Date): string {
